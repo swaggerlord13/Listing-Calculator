@@ -9,12 +9,16 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen",
     "Ubuntu", "Cantarell", "Fira Sans", "Droid Sans", "Helvetica Neue",
     sans-serif;
-  place-items: normal;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   display: block;
+  place-items: normal;
 }
 
 /* App Container - Full Width */
 .app-container {
+  min-height: 100vh;
+  width: 100%;
   background: linear-gradient(to bottom right, #0f172a, #581c87, #0f172a);
   position: relative;
   overflow-x: hidden;
@@ -32,12 +36,14 @@ body {
 .main-wrapper {
   position: relative;
   min-height: 100vh;
+  width: 100%;
   display: flex;
   flex-direction: column;
 }
 
 /* Header */
 .app-header {
+  width: 100%;
   background: linear-gradient(
     to right,
     rgba(147, 51, 234, 0.2),
@@ -48,6 +54,7 @@ body {
 }
 
 .header-content {
+  width: 100%;
   padding: 1rem 1rem;
   display: flex;
   align-items: center;
@@ -88,10 +95,12 @@ body {
 /* Main Content */
 .main-content {
   flex: 1;
+  width: 100%;
   padding: 1rem;
 }
 
 .content-card {
+  width: 100%;
   max-width: 100%;
   background: rgba(255, 255, 255, 0.1);
   backdrop-filter: blur(24px);
@@ -192,6 +201,28 @@ body {
   margin-top: 0.125rem;
 }
 
+/* Category Cache Badge */
+.category-cache-badge {
+  margin-bottom: 1.5rem;
+  padding: 1rem;
+  border-radius: 0.75rem;
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  transition: all 0.3s ease;
+}
+
+.category-cache-badge.new {
+  background: rgba(59, 130, 246, 0.2);
+  border: 1px solid rgba(59, 130, 246, 0.5);
+}
+
+.category-cache-badge.cached {
+  background: rgba(245, 158, 11, 0.2);
+  border: 1px solid rgba(245, 158, 11, 0.5);
+}
+
 /* Form Grid */
 .form-grid {
   display: grid;
@@ -264,8 +295,7 @@ body {
 
 .date-input:focus {
   outline: none;
-  kerning: 2px;
-  lighting-color: #a855f7;
+  box-shadow: 0 0 0 2px #a855f7;
   border-color: transparent;
 }
 
@@ -523,6 +553,46 @@ body {
 
 .clear-button:hover {
   background: #4b5563;
+}
+
+/* Cache Badge - Alternate Styles */
+.cache-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  border-radius: 0.75rem;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+  color: #86efac;
+}
+
+.cache-clear-btn {
+  margin-left: auto;
+  padding: 0.25rem;
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 0.375rem;
+  color: #f87171;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cache-clear-btn:hover {
+  background: rgba(239, 68, 68, 0.3);
+  border-color: rgba(239, 68, 68, 0.5);
+}
+
+.optional-badge {
+  font-size: 0.75rem;
+  color: #86efac;
+  font-weight: normal;
+  margin-left: 0.25rem;
 }
 
 /* Footer */
