@@ -3,16 +3,209 @@
 
 const DEBUG = false;
 
-// Load XLSX library only (PDF parsing done in main thread)
+// Load XLSX library
 importScripts("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js");
 
-// Helper: async sleep for yielding control
+// ============================================================================
+// OPTIMIZED CATEGORY MATCHING SYSTEM
+// ============================================================================
+
+const STOPWORDS = new Set([
+  "with",
+  "for",
+  "and",
+  "or",
+  "the",
+  "a",
+  "an",
+  "in",
+  "on",
+  "at",
+  "to",
+  "from",
+  "by",
+  "of",
+  "is",
+  "was",
+  "are",
+  "were",
+  "been",
+]);
+
+class CategoryIndex {
+  constructor() {
+    this.tokenIndex = new Map();
+    this.categories = [];
+    this.isInitialized = false;
+  }
+
+  tokenize(text) {
+    return text
+      .toLowerCase()
+      .replace(/rrp\s*£\d+/gi, "")
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .split(/\s+/)
+      .filter((word) => word.length > 2 && !STOPWORDS.has(word));
+  }
+
+  build(categoryMap) {
+    if (!categoryMap || categoryMap.length === 0) {
+      console.warn("Empty category map provided");
+      return;
+    }
+
+    const startTime = Date.now();
+    this.tokenIndex.clear();
+    this.categories = [];
+
+    categoryMap.forEach((cat, idx) => {
+      const categoryId = cat["Category ID"] || cat.CategoryID || cat.categoryId;
+      const categoryPath =
+        cat["Category Path"] || cat.CategoryPath || cat.categoryPath || "";
+
+      if (!categoryId || !categoryPath) return;
+
+      const depth = categoryPath.split(">").length;
+      const pathTokens = this.tokenize(categoryPath);
+
+      this.categories.push({
+        id: categoryId,
+        path: categoryPath,
+        tokens: pathTokens,
+        depth: depth,
+        index: idx,
+      });
+
+      pathTokens.forEach((token) => {
+        if (!this.tokenIndex.has(token)) {
+          this.tokenIndex.set(token, new Set());
+        }
+        this.tokenIndex.get(token).add(idx);
+      });
+    });
+
+    this.isInitialized = true;
+
+    const elapsed = Date.now() - startTime;
+
+    // Notify main thread about cache status
+    self.postMessage({
+      type: "category_cache",
+      count: this.categories.length,
+      buildTime: elapsed,
+      isNewUpload: true,
+    });
+
+    if (DEBUG) {
+      console.log(
+        `✓ Category index built: ${this.categories.length} categories, ${this.tokenIndex.size} tokens in ${elapsed}ms`
+      );
+    }
+  }
+
+  match(title) {
+    if (!this.isInitialized || this.categories.length === 0) {
+      return { categoryId: 47155, categoryPath: "Default", score: 0 };
+    }
+
+    const titleTokens = this.tokenize(title);
+
+    if (titleTokens.length === 0) {
+      return { categoryId: 47155, categoryPath: "Default", score: 0 };
+    }
+
+    const scores = new Map();
+
+    titleTokens.forEach((titleToken) => {
+      const matchingCategories = this.tokenIndex.get(titleToken);
+
+      if (!matchingCategories) return;
+
+      matchingCategories.forEach((categoryIndex) => {
+        const category = this.categories[categoryIndex];
+
+        if (!scores.has(categoryIndex)) {
+          scores.set(categoryIndex, {
+            exact: 0,
+            partial: 0,
+            depth: category.depth,
+            category: category,
+          });
+        }
+
+        const scoreData = scores.get(categoryIndex);
+
+        if (category.tokens.includes(titleToken)) {
+          scoreData.exact += 10;
+        }
+
+        category.tokens.forEach((catToken) => {
+          if (catToken.includes(titleToken) || titleToken.includes(catToken)) {
+            scoreData.partial += 5;
+          }
+        });
+      });
+    });
+
+    let bestMatch = null;
+    let bestScore = -1;
+
+    scores.forEach((scoreData) => {
+      const exactScore = scoreData.exact;
+      const partialScore = scoreData.partial;
+      const depthBonus = scoreData.depth * 3;
+
+      const matchedTokens = new Set();
+      titleTokens.forEach((tt) => {
+        if (
+          scoreData.category.tokens.some(
+            (ct) => ct === tt || ct.includes(tt) || tt.includes(ct)
+          )
+        ) {
+          matchedTokens.add(tt);
+        }
+      });
+      const coverageBonus = matchedTokens.size * 8;
+
+      const totalScore = exactScore + partialScore + depthBonus + coverageBonus;
+
+      if (totalScore > bestScore) {
+        bestScore = totalScore;
+        bestMatch = scoreData.category;
+      }
+    });
+
+    if (!bestMatch || bestScore < 5) {
+      if (DEBUG) console.log(`⚠ No good match for "${title}"`);
+      return { categoryId: 47155, categoryPath: "Default", score: 0 };
+    }
+
+    if (DEBUG) {
+      console.log(`✓ "${title}" → ${bestMatch.path} (${bestScore})`);
+    }
+
+    return {
+      categoryId: bestMatch.id,
+      categoryPath: bestMatch.path,
+      score: bestScore,
+    };
+  }
+}
+
+const categoryIndex = new CategoryIndex();
+
+function matchCategory(title) {
+  return categoryIndex.match(title).categoryId;
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Memoization cache for calculateSimilarity
-const similarityCache = new Map();
-
-// Postage rate table (default)
 const postageRateTable = [
   { maxWeight: 0, postage: 1.9662, code: 2 },
   { maxWeight: 2, postage: 3.8136, code: 5 },
@@ -20,7 +213,6 @@ const postageRateTable = [
   { maxWeight: 10, postage: 3.656, code: 10 },
 ];
 
-// Utility functions
 const round = (num, decimals = 2) => {
   return Math.round(num * Math.pow(10, decimals)) / Math.pow(10, decimals);
 };
@@ -98,143 +290,6 @@ const shortenTitle = (title, maxLength = 70) => {
   return result.join(" ").substring(0, maxLength).trim();
 };
 
-const calculateSimilarity = (str1, str2) => {
-  const cacheKey = `${str1}|${str2}`;
-  if (similarityCache.has(cacheKey)) {
-    return similarityCache.get(cacheKey);
-  }
-
-  const longer = str1.length > str2.length ? str1 : str2;
-  const shorter = str1.length > str2.length ? str2 : str1;
-
-  if (longer.length === 0) {
-    similarityCache.set(cacheKey, 1.0);
-    return 1.0;
-  }
-
-  const editDistance = (s1, s2) => {
-    s1 = s1.toLowerCase();
-    s2 = s2.toLowerCase();
-
-    const costs = [];
-    for (let i = 0; i <= s1.length; i++) {
-      let lastValue = i;
-      for (let j = 0; j <= s2.length; j++) {
-        if (i === 0) {
-          costs[j] = j;
-        } else if (j > 0) {
-          let newValue = costs[j - 1];
-          if (s1.charAt(i - 1) !== s2.charAt(j - 1)) {
-            newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
-          }
-          costs[j - 1] = lastValue;
-          lastValue = newValue;
-        }
-      }
-      if (i > 0) costs[s2.length] = lastValue;
-    }
-    return costs[s2.length];
-  };
-
-  const result =
-    (longer.length - editDistance(longer, shorter)) / longer.length;
-  similarityCache.set(cacheKey, result);
-  return result;
-};
-
-const matchCategory = (title, categoryMap) => {
-  if (!categoryMap || categoryMap.length === 0) return 47155;
-
-  const cleanTitle = title
-    .toLowerCase()
-    .replace(/rrp\s*£\d+/gi, "")
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const stopwords = [
-    "with",
-    "for",
-    "and",
-    "or",
-    "the",
-    "a",
-    "an",
-    "in",
-    "on",
-    "at",
-    "to",
-    "from",
-    "by",
-    "of",
-  ];
-  const titleTokens = cleanTitle
-    .split(/\s+/)
-    .filter((word) => word.length > 2 && !stopwords.includes(word));
-
-  if (titleTokens.length === 0) return 47155;
-
-  let bestMatch = { categoryId: 47155, score: 0, path: "" };
-
-  categoryMap.forEach((cat) => {
-    const categoryId = cat["Category ID"] || cat.CategoryID || cat.categoryId;
-    const categoryPath =
-      cat["Category Path"] || cat.CategoryPath || cat.categoryPath || "";
-
-    if (!categoryId || !categoryPath) return;
-
-    const cleanPath = categoryPath.toLowerCase();
-    const pathTokens = cleanPath
-      .replace(/[^\w\s]/g, " ")
-      .split(/\s+/)
-      .filter((word) => word.length > 2 && !stopwords.includes(word));
-
-    let score = 0;
-
-    titleTokens.forEach((titleToken) => {
-      pathTokens.forEach((pathToken) => {
-        const similarity = calculateSimilarity(titleToken, pathToken);
-
-        if (similarity > 0.8) {
-          score += 10;
-        } else if (similarity > 0.6) {
-          score += 6;
-        } else if (similarity > 0.4) {
-          score += 3;
-        }
-
-        if (pathToken.includes(titleToken) || titleToken.includes(pathToken)) {
-          score += 4;
-        }
-      });
-
-      if (cleanPath.includes(titleToken)) {
-        score += 8;
-      }
-    });
-
-    const levels = categoryPath.split(">").length;
-    score += levels * 2;
-
-    const matchedTokens = titleTokens.filter((tt) =>
-      pathTokens.some((pt) => calculateSimilarity(tt, pt) > 0.5)
-    );
-    score += matchedTokens.length * 5;
-
-    if (score > bestMatch.score) {
-      bestMatch = { categoryId, score, path: categoryPath };
-    }
-  });
-
-  if (DEBUG && bestMatch.score > 0) {
-    console.log(
-      `✓ Matched: "${title}" → ${bestMatch.path} (Score: ${bestMatch.score})`
-    );
-  }
-
-  return bestMatch.categoryId;
-};
-
 const parsePostageRates = (postageData) => {
   const rates = [];
   for (let i = 1; i < postageData.length; i++) {
@@ -254,8 +309,31 @@ const parsePostageRates = (postageData) => {
   return rates;
 };
 
-// Main message handler
+// ============================================================================
+// MAIN MESSAGE HANDLER
+// ============================================================================
+
 self.onmessage = async (e) => {
+  // Check if this is a status request
+  if (e.data.type === "check_cache_status") {
+    if (categoryIndex.isInitialized) {
+      self.postMessage({
+        type: "category_cache",
+        count: categoryIndex.categories.length,
+        isCached: true,
+        isNewUpload: false,
+      });
+    } else {
+      self.postMessage({
+        type: "category_cache",
+        count: 0,
+        isCached: false,
+        isNewUpload: false,
+      });
+    }
+    return;
+  }
+
   const { excelBuffer, pdfDataArray, categoryBuffer, postageBuffer, date } =
     e.data;
 
@@ -269,13 +347,13 @@ self.onmessage = async (e) => {
     const worksheet = workbook.Sheets[sheetName];
     const data = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
 
-    // Load Category Map
+    // Load Category Map and BUILD INDEX
     let categoryMap = [];
 
     if (categoryBuffer) {
       self.postMessage({
         type: "progress",
-        message: "Loading category map...",
+        message: "Loading & indexing category map...",
       });
       await sleep(0);
 
@@ -288,8 +366,13 @@ self.onmessage = async (e) => {
         ) || catWorkbook.SheetNames[0];
       const catWorksheet = catWorkbook.Sheets[catSheetName];
       categoryMap = XLSX.utils.sheet_to_json(catWorksheet);
-      if (DEBUG) console.log(`Loaded ${categoryMap.length} categories`);
-    } else {
+
+      // BUILD THE INDEX HERE - CRITICAL!
+      categoryIndex.build(categoryMap);
+
+      if (DEBUG) console.log(`✓ Indexed ${categoryMap.length} categories`);
+    } else if (!categoryIndex.isInitialized) {
+      // No upload and no cache - check main Excel
       const catSheetName = workbook.SheetNames.find(
         (name) =>
           name.toLowerCase().includes("category") ||
@@ -298,9 +381,25 @@ self.onmessage = async (e) => {
       if (catSheetName) {
         const catWorksheet = workbook.Sheets[catSheetName];
         categoryMap = XLSX.utils.sheet_to_json(catWorksheet);
+
+        // BUILD THE INDEX HERE TOO
+        categoryIndex.build(categoryMap);
+
         if (DEBUG)
-          console.log(`Loaded ${categoryMap.length} categories from Excel`);
+          console.log(`✓ Indexed ${categoryMap.length} categories from Excel`);
       }
+    } else {
+      // Using cached categories
+      self.postMessage({
+        type: "category_cache",
+        count: categoryIndex.categories.length,
+        isCached: true,
+        isNewUpload: false,
+      });
+      if (DEBUG)
+        console.log(
+          `✓ Using cached categories (${categoryIndex.categories.length})`
+        );
     }
 
     // Load Postage Rates
@@ -321,7 +420,7 @@ self.onmessage = async (e) => {
       });
 
       postageRates = parsePostageRates(postageData);
-      if (DEBUG) console.log(`Loaded ${postageRates.length} postage rates`);
+      if (DEBUG) console.log(`✓ Loaded ${postageRates.length} postage rates`);
     } else {
       const postageSheetName = workbook.SheetNames.find((name) =>
         name.toLowerCase().includes("postage")
@@ -333,14 +432,16 @@ self.onmessage = async (e) => {
         });
         postageRates = parsePostageRates(postageData);
         if (DEBUG)
-          console.log(`Loaded ${postageRates.length} postage rates from Excel`);
+          console.log(
+            `✓ Loaded ${postageRates.length} postage rates from Excel`
+          );
       }
     }
 
-    // Extract SKUs from original Column C (index 2) - will be Column E after shift
+    // Extract SKUs
     self.postMessage({
       type: "progress",
-      message: "Extracting SKUs from Column C (will be Column E)...",
+      message: "Extracting SKUs from Column C...",
     });
     await sleep(0);
 
@@ -349,7 +450,7 @@ self.onmessage = async (e) => {
 
     for (let idx = 0; idx < dataRows.length; idx++) {
       const row = dataRows[idx];
-      const sku = (row[2] && String(row[2]).trim()) || ""; // Original Column C
+      const sku = (row[2] && String(row[2]).trim()) || "";
 
       if (sku) {
         manifestSKUs.push({ sku, rowIndex: idx });
@@ -434,7 +535,7 @@ self.onmessage = async (e) => {
       data: { items, totalShipping },
     });
 
-    // Calculate proportional costs for duplicates
+    // Calculate proportional costs
     self.postMessage({
       type: "progress",
       message: "Calculating proportional costs...",
@@ -472,7 +573,7 @@ self.onmessage = async (e) => {
       await sleep(0);
     }
 
-    // Group items by PDF for shipping
+    // Allocate shipping
     self.postMessage({
       type: "progress",
       message: "Allocating shipping costs...",
@@ -659,7 +760,8 @@ self.onmessage = async (e) => {
       const rrpText = `RRP £${roundedRRP}`;
       const fullTitle = `${shortenedTitle} ${rrpText}`;
 
-      const categoryId = matchCategory(originalTitle, categoryMap);
+      // USE OPTIMIZED CATEGORY MATCHING - MUCH FASTER!
+      const categoryId = matchCategory(originalTitle);
 
       const skuLocation = `/${sku}/${postageInfo.code}`;
       const price = round(rrp * 0.85 + 0.15 + postageInfo.postage);
@@ -967,13 +1069,13 @@ self.onmessage = async (e) => {
     const excelUrl = URL.createObjectURL(excelBlob);
     const excelFilename = `LISTING_${dateSKU}.xlsx`;
 
-    // Create eBay CSV (comma-separated format)
+    // Create eBay CSV
     self.postMessage({ type: "progress", message: "Generating eBay CSV..." });
     await sleep(0);
 
     const ebayRows = [];
     ebayRows.push(
-      "#INFO,Version=0.0.2,Template= eBay-draft-listings-template_GB,,,,,,,,"
+      "#INFO,Version=0.0.2,Template= eBay-draft-listings-template_GB,,,,,,,"
     );
     ebayRows.push(
       "#INFO Action and Category ID are required fields. 1) Set Action to Draft 2) Please find the category ID for your listings here: https://pages.ebay.com/sellerinformation/news/categorychanges.html,,,,,,,,,,"
@@ -988,10 +1090,10 @@ self.onmessage = async (e) => {
 
     processedRows.slice(1, -1).forEach((row) => {
       const action = "Draft";
-      const customLabel = row[33] || ""; // SKU at index 33
+      const customLabel = row[33] || "";
       const categoryId = row[42] || 47155;
       const title = row[43] || "";
-      const upc = String(row[7] || "").toLowerCase(); // ASIN in lowercase (original column at index 7)
+      const upc = String(row[7] || "").toLowerCase();
       const price = round(row[45]) || 0;
       const quantity = row[46] || 1;
       const photoUrl = row[47] || "";
@@ -1007,7 +1109,6 @@ self.onmessage = async (e) => {
         return str;
       };
 
-      // Comma-separated values
       ebayRows.push(
         [
           action,
@@ -1030,10 +1131,9 @@ self.onmessage = async (e) => {
     const csvUrl = URL.createObjectURL(csvBlob);
     const csvFilename = `ebay_upload_${dateSKU}.csv`;
 
-    const categoryInfo =
-      categoryMap.length > 0
-        ? ` Categories matched from ${categoryMap.length} options.`
-        : " Using default category 47155.";
+    const categoryInfo = categoryIndex.isInitialized
+      ? ` Categories matched from ${categoryIndex.categories.length} options.`
+      : " Using default category 47155.";
     const postageInfo = postageRates
       ? ` Postage rates from uploaded table (${postageRates.length} tiers).`
       : " Using default postage rates.";
