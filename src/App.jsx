@@ -1,5 +1,5 @@
-import React, { useState, useRef } from 'react';
-import { Upload, Calendar, Download, FileSpreadsheet, FileText, AlertCircle, RefreshCw } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import { Upload, Calendar, Download, FileSpreadsheet, FileText, AlertCircle, RefreshCw, Database } from 'lucide-react';
 import './App.css';
 
 const ListingCalculator = () => {
@@ -14,12 +14,89 @@ const ListingCalculator = () => {
   const [progress, setProgress] = useState('');
   const [extractedData, setExtractedData] = useState(null);
   const [pdfDataArray, setPdfDataArray] = useState([]);
+  const [categoryStatus, setCategoryStatus] = useState(null);
   const workerRef = useRef(null);
   
   const excelInputRef = useRef(null);
   const pdfInputRef = useRef(null);
   const categoryInputRef = useRef(null);
   const postageInputRef = useRef(null);
+
+  // Initialize worker and check cache on mount
+  useEffect(() => {
+    if (!workerRef.current) {
+      workerRef.current = new Worker(
+        new URL('./workers/fileProcessor.js', import.meta.url),
+        { type: 'classic' }
+      );
+
+      workerRef.current.onmessage = (e) => {
+        const { type, message, data, url, filename, csvUrl, csvFilename, error: workerError, count, isCached, isNewUpload } = e.data;
+
+        if (type === 'progress') {
+          setProgress(message);
+        } else if (type === 'extracted') {
+          setExtractedData(data);
+        } else if (type === 'category_cache') {
+          if (count > 0) {
+            setCategoryStatus({
+              count,
+              isCached,
+              isNew: isNewUpload
+            });
+          } else {
+            setCategoryStatus(null);
+          }
+        } else if (type === 'success') {
+          setProgress('Downloading files...');
+          
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+
+          const csvLink = document.createElement('a');
+          csvLink.href = csvUrl;
+          csvLink.download = csvFilename;
+          document.body.appendChild(csvLink);
+          csvLink.click();
+          document.body.removeChild(csvLink);
+          URL.revokeObjectURL(csvUrl);
+
+          setSuccess(message);
+          setProgress('');
+          setProcessing(false);
+          
+          setTimeout(() => {
+            clearAllInputs();
+          }, 3000);
+        } else if (type === 'error') {
+          setError('Error: ' + workerError);
+          setProgress('');
+          setProcessing(false);
+        }
+      };
+
+      workerRef.current.onerror = (error) => {
+        setError('Worker error: ' + error.message);
+        setProgress('');
+        setProcessing(false);
+      };
+
+      // Check if categories are cached
+      workerRef.current.postMessage({ type: 'check_cache_status' });
+    }
+
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+    };
+  }, []);
 
   const formatDateToSKU = (dateStr) => {
     const [year, month, day] = dateStr.split('-');
@@ -143,62 +220,7 @@ const ListingCalculator = () => {
       }
 
       setPdfDataArray(pdfDataArray);
-
       setProgress('Initializing worker...');
-      if (!workerRef.current) {
-        workerRef.current = new Worker(
-          new URL('./workers/fileProcessor.js', import.meta.url),
-          { type: 'classic' }
-        );
-      }
-
-      const worker = workerRef.current;
-
-      worker.onmessage = (e) => {
-        const { type, message, data, url, filename, csvUrl, csvFilename, error: workerError } = e.data;
-
-        if (type === 'progress') {
-          setProgress(message);
-        } else if (type === 'extracted') {
-          setExtractedData(data);
-        } else if (type === 'success') {
-          setProgress('Downloading files...');
-          
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = filename;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-
-          const csvLink = document.createElement('a');
-          csvLink.href = csvUrl;
-          csvLink.download = csvFilename;
-          document.body.appendChild(csvLink);
-          csvLink.click();
-          document.body.removeChild(csvLink);
-          URL.revokeObjectURL(csvUrl);
-
-          setSuccess(message);
-          setProgress('');
-          setProcessing(false);
-          
-          setTimeout(() => {
-            clearAllInputs();
-          }, 3000);
-        } else if (type === 'error') {
-          setError('Error: ' + workerError);
-          setProgress('');
-          setProcessing(false);
-        }
-      };
-
-      worker.onerror = (error) => {
-        setError('Worker error: ' + error.message);
-        setProgress('');
-        setProcessing(false);
-      };
 
       const excelBuffer = await excelFile.arrayBuffer();
 
@@ -212,7 +234,7 @@ const ListingCalculator = () => {
         postageBuffer = await postageRateFile.arrayBuffer();
       }
 
-      worker.postMessage({
+      workerRef.current.postMessage({
         excelBuffer,
         pdfDataArray,
         categoryBuffer,
@@ -251,6 +273,44 @@ const ListingCalculator = () => {
             <p className="content-subtitle">
               Generate Excel listing + eBay CSV from invoice & product data
             </p>
+
+            {/* Category Cache Status Badge */}
+            {categoryStatus && (
+              <div className="alert" style={{
+                background: categoryStatus.isNew 
+                  ? 'rgba(59, 130, 246, 0.2)' 
+                  : 'rgba(245, 158, 11, 0.2)',
+                border: categoryStatus.isNew 
+                  ? '1px solid rgba(59, 130, 246, 0.5)' 
+                  : '1px solid rgba(245, 158, 11, 0.5)'
+              }}>
+                <Database 
+                  size={20} 
+                  style={{ 
+                    color: categoryStatus.isNew ? '#60a5fa' : '#fbbf24',
+                    flexShrink: 0,
+                    marginTop: '0.125rem'
+                  }} 
+                />
+                <div style={{ flex: 1 }}>
+                  <p style={{ 
+                    margin: 0, 
+                    fontWeight: 600, 
+                    fontSize: '0.875rem',
+                    color: categoryStatus.isNew ? '#bfdbfe' : '#fde68a'
+                  }}>
+                    {categoryStatus.isNew ? '✨ New Category Map Loaded' : '💾 Using Cached Category Map'}
+                  </p>
+                  <p style={{ 
+                    margin: '0.25rem 0 0', 
+                    fontSize: '0.75rem',
+                    color: categoryStatus.isNew ? '#93c5fd' : '#fcd34d'
+                  }}>
+                    {categoryStatus.count} categories indexed and ready for matching
+                  </p>
+                </div>
+              </div>
+            )}
 
             {error && (
               <div className="alert alert-error">
