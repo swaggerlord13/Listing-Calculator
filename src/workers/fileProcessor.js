@@ -1,0 +1,1056 @@
+// eslint-disable-next-line no-redeclare
+/* global self, importScripts, XLSX */
+
+const DEBUG = false;
+
+// Load XLSX library only (PDF parsing done in main thread)
+importScripts("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js");
+
+// Helper: async sleep for yielding control
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Memoization cache for calculateSimilarity
+const similarityCache = new Map();
+
+// Postage rate table (default)
+const postageRateTable = [
+  { maxWeight: 0, postage: 1.9662, code: 2 },
+  { maxWeight: 2, postage: 3.8136, code: 5 },
+  { maxWeight: 5, postage: 4.156, code: 10 },
+  { maxWeight: 10, postage: 3.656, code: 10 },
+];
+
+// Utility functions
+const round = (num, decimals = 2) => {
+  return Math.round(num * Math.pow(10, decimals)) / Math.pow(10, decimals);
+};
+
+const getExcelColumn = (col) => {
+  let temp,
+    letter = "";
+  while (col >= 0) {
+    temp = col % 26;
+    letter = String.fromCharCode(temp + 65) + letter;
+    col = (col - temp - 1) / 26;
+  }
+  return letter;
+};
+
+const formatDateToSKU = (dateStr) => {
+  const [year, month, day] = dateStr.split("-");
+  return `${day}${month}${year.slice(2)}`;
+};
+
+const getPostageInfo = (weight, postageRates = null) => {
+  const rates = postageRates || postageRateTable;
+  let selectedRate = rates[0];
+  for (let i = 0; i < rates.length; i++) {
+    if (weight >= rates[i].maxWeight) {
+      selectedRate = rates[i];
+    } else {
+      break;
+    }
+  }
+  return { postage: selectedRate.postage, code: selectedRate.code };
+};
+
+const generateTags = (title) => {
+  if (!title) return "";
+  const words = title
+    .toLowerCase()
+    .replace(/[^\w\s,]/g, "")
+    .split(/[\s,]+/)
+    .filter((w) => w.length > 2);
+  return words.slice(0, 15).join(", ");
+};
+
+const shortenTitle = (title, maxLength = 70) => {
+  if (!title) return "";
+  const fillers = [
+    "with",
+    "for",
+    "the",
+    "and",
+    "&",
+    "-",
+    "a",
+    "an",
+    "featuring",
+    "includes",
+    "comes with",
+    "perfect for",
+    "that",
+  ];
+  const words = title.split(/[\s,]+/);
+  let result = [];
+  let length = 0;
+
+  for (let word of words) {
+    const cleanWord = word.replace(/[^\w\s]/g, "");
+    if (fillers.includes(cleanWord.toLowerCase())) continue;
+    if (length + word.length + 1 <= maxLength) {
+      result.push(word);
+      length += word.length + 1;
+    } else {
+      break;
+    }
+  }
+  return result.join(" ").substring(0, maxLength).trim();
+};
+
+const calculateSimilarity = (str1, str2) => {
+  const cacheKey = `${str1}|${str2}`;
+  if (similarityCache.has(cacheKey)) {
+    return similarityCache.get(cacheKey);
+  }
+
+  const longer = str1.length > str2.length ? str1 : str2;
+  const shorter = str1.length > str2.length ? str2 : str1;
+
+  if (longer.length === 0) {
+    similarityCache.set(cacheKey, 1.0);
+    return 1.0;
+  }
+
+  const editDistance = (s1, s2) => {
+    s1 = s1.toLowerCase();
+    s2 = s2.toLowerCase();
+
+    const costs = [];
+    for (let i = 0; i <= s1.length; i++) {
+      let lastValue = i;
+      for (let j = 0; j <= s2.length; j++) {
+        if (i === 0) {
+          costs[j] = j;
+        } else if (j > 0) {
+          let newValue = costs[j - 1];
+          if (s1.charAt(i - 1) !== s2.charAt(j - 1)) {
+            newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
+          }
+          costs[j - 1] = lastValue;
+          lastValue = newValue;
+        }
+      }
+      if (i > 0) costs[s2.length] = lastValue;
+    }
+    return costs[s2.length];
+  };
+
+  const result =
+    (longer.length - editDistance(longer, shorter)) / longer.length;
+  similarityCache.set(cacheKey, result);
+  return result;
+};
+
+const matchCategory = (title, categoryMap) => {
+  if (!categoryMap || categoryMap.length === 0) return 47155;
+
+  const cleanTitle = title
+    .toLowerCase()
+    .replace(/rrp\s*£\d+/gi, "")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const stopwords = [
+    "with",
+    "for",
+    "and",
+    "or",
+    "the",
+    "a",
+    "an",
+    "in",
+    "on",
+    "at",
+    "to",
+    "from",
+    "by",
+    "of",
+  ];
+  const titleTokens = cleanTitle
+    .split(/\s+/)
+    .filter((word) => word.length > 2 && !stopwords.includes(word));
+
+  if (titleTokens.length === 0) return 47155;
+
+  let bestMatch = { categoryId: 47155, score: 0, path: "" };
+
+  categoryMap.forEach((cat) => {
+    const categoryId = cat["Category ID"] || cat.CategoryID || cat.categoryId;
+    const categoryPath =
+      cat["Category Path"] || cat.CategoryPath || cat.categoryPath || "";
+
+    if (!categoryId || !categoryPath) return;
+
+    const cleanPath = categoryPath.toLowerCase();
+    const pathTokens = cleanPath
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((word) => word.length > 2 && !stopwords.includes(word));
+
+    let score = 0;
+
+    titleTokens.forEach((titleToken) => {
+      pathTokens.forEach((pathToken) => {
+        const similarity = calculateSimilarity(titleToken, pathToken);
+
+        if (similarity > 0.8) {
+          score += 10;
+        } else if (similarity > 0.6) {
+          score += 6;
+        } else if (similarity > 0.4) {
+          score += 3;
+        }
+
+        if (pathToken.includes(titleToken) || titleToken.includes(pathToken)) {
+          score += 4;
+        }
+      });
+
+      if (cleanPath.includes(titleToken)) {
+        score += 8;
+      }
+    });
+
+    const levels = categoryPath.split(">").length;
+    score += levels * 2;
+
+    const matchedTokens = titleTokens.filter((tt) =>
+      pathTokens.some((pt) => calculateSimilarity(tt, pt) > 0.5)
+    );
+    score += matchedTokens.length * 5;
+
+    if (score > bestMatch.score) {
+      bestMatch = { categoryId, score, path: categoryPath };
+    }
+  });
+
+  if (DEBUG && bestMatch.score > 0) {
+    console.log(
+      `✓ Matched: "${title}" → ${bestMatch.path} (Score: ${bestMatch.score})`
+    );
+  }
+
+  return bestMatch.categoryId;
+};
+
+const parsePostageRates = (postageData) => {
+  const rates = [];
+  for (let i = 1; i < postageData.length; i++) {
+    const row = postageData[i];
+    if (!row || row.length === 0) continue;
+
+    const maxWeight = parseFloat(row[0]) || 0;
+    const postage = parseFloat(row[1]) || 0;
+    const code = parseInt(row[6]) || 0;
+
+    if (postage > 0) {
+      rates.push({ maxWeight, postage, code });
+    }
+  }
+  rates.sort((a, b) => a.maxWeight - b.maxWeight);
+  if (DEBUG) console.log("Parsed Postage Rates:", rates);
+  return rates;
+};
+
+// Main message handler
+self.onmessage = async (e) => {
+  const { excelBuffer, pdfDataArray, categoryBuffer, postageBuffer, date } =
+    e.data;
+
+  try {
+    // Load Excel
+    self.postMessage({ type: "progress", message: "Loading Excel file..." });
+    await sleep(0);
+
+    const workbook = XLSX.read(new Uint8Array(excelBuffer));
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
+
+    // Load Category Map
+    let categoryMap = [];
+
+    if (categoryBuffer) {
+      self.postMessage({
+        type: "progress",
+        message: "Loading category map...",
+      });
+      await sleep(0);
+
+      const catWorkbook = XLSX.read(new Uint8Array(categoryBuffer));
+      const catSheetName =
+        catWorkbook.SheetNames.find(
+          (name) =>
+            name.toLowerCase().includes("category") ||
+            name.toLowerCase().includes("map")
+        ) || catWorkbook.SheetNames[0];
+      const catWorksheet = catWorkbook.Sheets[catSheetName];
+      categoryMap = XLSX.utils.sheet_to_json(catWorksheet);
+      if (DEBUG) console.log(`Loaded ${categoryMap.length} categories`);
+    } else {
+      const catSheetName = workbook.SheetNames.find(
+        (name) =>
+          name.toLowerCase().includes("category") ||
+          name.toLowerCase().includes("map")
+      );
+      if (catSheetName) {
+        const catWorksheet = workbook.Sheets[catSheetName];
+        categoryMap = XLSX.utils.sheet_to_json(catWorksheet);
+        if (DEBUG)
+          console.log(`Loaded ${categoryMap.length} categories from Excel`);
+      }
+    }
+
+    // Load Postage Rates
+    let postageRates = null;
+
+    if (postageBuffer) {
+      self.postMessage({
+        type: "progress",
+        message: "Loading postage rates...",
+      });
+      await sleep(0);
+
+      const postageWorkbook = XLSX.read(new Uint8Array(postageBuffer));
+      const postageSheetName = postageWorkbook.SheetNames[0];
+      const postageWorksheet = postageWorkbook.Sheets[postageSheetName];
+      const postageData = XLSX.utils.sheet_to_json(postageWorksheet, {
+        header: 1,
+      });
+
+      postageRates = parsePostageRates(postageData);
+      if (DEBUG) console.log(`Loaded ${postageRates.length} postage rates`);
+    } else {
+      const postageSheetName = workbook.SheetNames.find((name) =>
+        name.toLowerCase().includes("postage")
+      );
+      if (postageSheetName) {
+        const postageWorksheet = workbook.Sheets[postageSheetName];
+        const postageData = XLSX.utils.sheet_to_json(postageWorksheet, {
+          header: 1,
+        });
+        postageRates = parsePostageRates(postageData);
+        if (DEBUG)
+          console.log(`Loaded ${postageRates.length} postage rates from Excel`);
+      }
+    }
+
+    // Extract SKUs from original Column C (index 2) - will be Column E after shift
+    self.postMessage({
+      type: "progress",
+      message: "Extracting SKUs from Column C (will be Column E)...",
+    });
+    await sleep(0);
+
+    const dataRows = data.slice(1);
+    const manifestSKUs = [];
+
+    for (let idx = 0; idx < dataRows.length; idx++) {
+      const row = dataRows[idx];
+      const sku = (row[2] && String(row[2]).trim()) || ""; // Original Column C
+
+      if (sku) {
+        manifestSKUs.push({ sku, rowIndex: idx });
+        if (DEBUG) console.log(`✓ Row ${idx + 1}: Column C = "${sku}"`);
+      } else {
+        if (DEBUG) console.warn(`⚠ Row ${idx + 1}: Column C empty`);
+      }
+
+      if (idx % 50 === 0) await sleep(0);
+    }
+
+    if (DEBUG) console.log(`\n✓ Total SKUs: ${manifestSKUs.length}`);
+
+    // Search PDFs for SKUs
+    self.postMessage({
+      type: "progress",
+      message: "Searching PDFs for SKU prices...",
+    });
+    await sleep(0);
+
+    const items = [];
+
+    for (let i = 0; i < manifestSKUs.length; i++) {
+      const { sku } = manifestSKUs[i];
+      const skuRegex = new RegExp(`\\b${sku.replace(/[-]/g, "[-]?")}\\b`, "gi");
+      let found = false;
+
+      for (let pdfData of pdfDataArray) {
+        const match = skuRegex.exec(pdfData.text);
+
+        if (match) {
+          const skuIndex = match.index;
+          const textAfterSKU = pdfData.text.substring(skuIndex, skuIndex + 200);
+          const priceMatches = textAfterSKU.match(/£\s*(\d+\.?\d*)/g);
+
+          if (priceMatches && priceMatches.length > 0) {
+            const firstPrice = parseFloat(priceMatches[0].replace(/£\s*/g, ""));
+            items.push({
+              sku: sku,
+              cost: firstPrice,
+              pdfIndex: pdfData.index,
+              pdfName: pdfData.name,
+              shipping: pdfData.shipping,
+              invoiceDate: pdfData.invoiceDate,
+              vendorNumber: pdfData.vendorNumber,
+            });
+            if (DEBUG)
+              console.log(
+                `✓ ${sku} → £${firstPrice.toFixed(2)} (PDF ${
+                  pdfData.index + 1
+                })`
+              );
+            found = true;
+            break;
+          }
+        }
+      }
+
+      if (!found) {
+        if (DEBUG) console.warn(`⚠ SKU not found: ${sku}`);
+        items.push({
+          sku: sku,
+          cost: 0,
+          pdfIndex: -1,
+          pdfName: "Not found",
+          shipping: 0,
+          invoiceDate: "",
+          vendorNumber: "",
+        });
+      }
+
+      if (i % 20 === 0) await sleep(0);
+    }
+
+    const totalShipping = pdfDataArray.reduce(
+      (sum, pdf) => sum + pdf.shipping,
+      0
+    );
+
+    self.postMessage({
+      type: "extracted",
+      data: { items, totalShipping },
+    });
+
+    // Calculate proportional costs for duplicates
+    self.postMessage({
+      type: "progress",
+      message: "Calculating proportional costs...",
+    });
+    await sleep(0);
+
+    const skuGroups = {};
+    manifestSKUs.forEach(({ sku, rowIndex }) => {
+      if (!skuGroups[sku]) skuGroups[sku] = [];
+      skuGroups[sku].push(rowIndex);
+    });
+
+    const proportionalCosts = {};
+    for (const sku of Object.keys(skuGroups)) {
+      const rowIndices = skuGroups[sku];
+      const pdfItem = items.find((item) => item.sku === sku);
+      const invoiceCost = pdfItem ? pdfItem.cost : 0;
+
+      if (rowIndices.length > 1) {
+        const totalRRP = rowIndices.reduce((sum, idx) => {
+          const rrp = parseFloat(dataRows[idx][23]) || 0;
+          return sum + rrp;
+        }, 0);
+
+        rowIndices.forEach((idx) => {
+          const itemRRP = parseFloat(dataRows[idx][23]) || 0;
+          const proportionalCost =
+            totalRRP > 0 ? (itemRRP / totalRRP) * invoiceCost : 0;
+          proportionalCosts[idx] = proportionalCost;
+        });
+      } else {
+        proportionalCosts[rowIndices[0]] = invoiceCost;
+      }
+
+      await sleep(0);
+    }
+
+    // Group items by PDF for shipping
+    self.postMessage({
+      type: "progress",
+      message: "Allocating shipping costs...",
+    });
+    await sleep(0);
+
+    const itemsByPDF = {};
+
+    dataRows.forEach((row, idx) => {
+      const manifestSKU = manifestSKUs[idx]?.sku || "";
+      const pdfItem = items.find((item) => item.sku === manifestSKU);
+      const pdfIndex = pdfItem ? pdfItem.pdfIndex : -1;
+      const pdfShipping = pdfItem ? pdfItem.shipping : 0;
+
+      if (!itemsByPDF[pdfIndex]) {
+        itemsByPDF[pdfIndex] = {
+          items: [],
+          shipping: pdfShipping,
+          totalWeight: 0,
+        };
+      }
+
+      const weight = parseFloat(row[20]) || 0;
+      itemsByPDF[pdfIndex].items.push({ rowIndex: idx, weight });
+      itemsByPDF[pdfIndex].totalWeight += weight;
+    });
+
+    const itemShipping = {};
+    for (const pdfIndex of Object.keys(itemsByPDF)) {
+      const pdfGroup = itemsByPDF[pdfIndex];
+
+      pdfGroup.items.forEach(({ rowIndex, weight }) => {
+        const shipping =
+          pdfGroup.totalWeight > 0
+            ? (weight / pdfGroup.totalWeight) * pdfGroup.shipping
+            : 0;
+        itemShipping[rowIndex] = shipping;
+      });
+
+      await sleep(0);
+    }
+
+    // Build Excel workbook
+    self.postMessage({
+      type: "progress",
+      message: "Building Excel workbook...",
+    });
+    await sleep(0);
+
+    const dateSKU = formatDateToSKU(date);
+    const asinToSKU = {};
+    let skuCounter = 1;
+
+    let totalRRP = 0;
+    let totalCost = 0;
+    let totalShippingAlloc = 0;
+    let totalVAT = 0;
+    let totalTotalCost = 0;
+
+    const processedRows = [];
+
+    const headerRow = [
+      "Order Date",
+      "Vendor",
+      ...data[0].slice(0, 24),
+      "Cost",
+      "Shipping ",
+      "VAT",
+      "Total Cost",
+      "Cost Per one",
+      "Postage",
+      "Postage code",
+      "SKU",
+      "Location",
+      "SKU Location ",
+      "Shorten Name",
+      "",
+      "",
+      "",
+      "Action(SiteID=UK|Country=GB|Currency=GBP|Version=1193|CC=UTF-8)",
+      "Custom label (SKU)",
+      "Category ID",
+      "Title",
+      "UPC",
+      "Price",
+      "Quantity",
+      "Item photo URL",
+      "Condition ID",
+      "Description",
+      "Format",
+      "",
+      "",
+      "SKU",
+      "Title",
+      "Description",
+      "Tags",
+      "MetaKeywords",
+      "MetaDescription",
+      "MobileDescription",
+      "CategoryID",
+      "StoreCategory",
+      "PrivateListing",
+      "UpToQuantity",
+      "WarehouseQuantity",
+      "InventoryControl",
+      "Price",
+      "WholesalePrice",
+      "BestOffer",
+      "BestOfferAccept",
+      "BestOfferDecline",
+      "C:MPN",
+      "C:Brand",
+      "C:Size",
+      "Condition",
+      "CountryCode",
+      "Location",
+      "PostalCode",
+      "PolicyPayment",
+      "PolicyShipping",
+      "PolicyReturn",
+      "PackageType",
+      "MeasurementSystem",
+      "PackageLength",
+      "PackageWidth",
+      "PackageDepth",
+      "WeightMajor",
+      "WeightMinor",
+      "Image 1",
+      "Image 2",
+      "Image 3",
+      "Image 4",
+      "Image 5",
+      "Image 6",
+      "ASIN",
+      "ConditionNote",
+      "OriginalRetailPrice",
+      "Model",
+      "EAN",
+      "3DsellersCSVTemplateVersion",
+      "",
+      "",
+      "SKU",
+      "CONDITION",
+      "EBAY Title",
+      "BRAND",
+    ];
+    processedRows.push(headerRow);
+
+    for (let idx = 0; idx < dataRows.length; idx++) {
+      const row = dataRows[idx];
+
+      const asin = String(row[5] || "").toLowerCase();
+      const weight = parseFloat(row[20]) || 0;
+      const quantity = parseInt(row[17]) || 1;
+      const rrp = parseFloat(row[22]) || 0;
+      const brand = row[8] || "";
+      const condition = row[18] || "";
+
+      const manifestSKU = manifestSKUs[idx]?.sku || "";
+      const pdfItem = items.find((item) => item.sku === manifestSKU);
+
+      const invoiceDate = pdfItem ? pdfItem.invoiceDate : "";
+      const vendorNumber = pdfItem ? pdfItem.vendorNumber : "";
+
+      const cost = round(proportionalCosts[idx] || 0);
+      const shipping = round(itemShipping[idx] || 0);
+
+      if (asin && !asinToSKU[asin]) {
+        asinToSKU[asin] = dateSKU + String(skuCounter).padStart(2, "0");
+        skuCounter++;
+      }
+      const sku = asinToSKU[asin] || dateSKU + "01";
+
+      const vat = round((cost + shipping) * 0.2);
+      const totalCostCalc = round(cost + shipping + vat);
+      const costPerOne = round(
+        quantity > 0 ? totalCostCalc / quantity : totalCostCalc
+      );
+      const postageInfo = getPostageInfo(weight, postageRates);
+
+      const originalTitle = row[3] || "";
+      const shortenedTitle = shortenTitle(originalTitle);
+      const roundedRRP = Math.ceil(rrp);
+      const rrpText = `RRP £${roundedRRP}`;
+      const fullTitle = `${shortenedTitle} ${rrpText}`;
+
+      const categoryId = matchCategory(originalTitle, categoryMap);
+
+      const skuLocation = `/${sku}/${postageInfo.code}`;
+      const price = round(rrp * 0.85 + 0.15 + postageInfo.postage);
+      const bestOffer = round(price * 0.93);
+
+      const imageURL =
+        [row[11], row[12], row[13], row[14], row[15], row[16]]
+          .filter((img) => img && img !== "N/A")
+          .join("|") || "";
+
+      const tags = generateTags(fullTitle);
+      const description = String(row[4] || "");
+      const metaDesc = `${tags}. ${description.substring(0, 150)}...`;
+
+      totalRRP += rrp;
+      totalCost += cost;
+      totalShippingAlloc += shipping;
+      totalVAT += vat;
+      totalTotalCost += totalCostCalc;
+
+      const newRow = [
+        invoiceDate,
+        vendorNumber,
+        ...row.slice(0, 24),
+        cost,
+        shipping,
+        vat,
+        totalCostCalc,
+        costPerOne,
+        postageInfo.postage,
+        postageInfo.code,
+        sku,
+        "",
+        skuLocation,
+        shortenedTitle,
+        "RRP £",
+        roundedRRP,
+        rrpText,
+        "Draft",
+        skuLocation,
+        categoryId,
+        fullTitle,
+        manifestSKU,
+        price,
+        quantity,
+        imageURL,
+        condition,
+        row[4] || "",
+        "FixedPrice",
+        "",
+        "",
+        skuLocation,
+        fullTitle,
+        row[4] || "",
+        dateSKU,
+        tags,
+        metaDesc,
+        metaDesc,
+        20685,
+        1,
+        "",
+        quantity,
+        quantity,
+        "",
+        price,
+        costPerOne,
+        "true",
+        bestOffer,
+        "",
+        "N/A",
+        brand,
+        "",
+        "",
+        "GB",
+        "Dartford",
+        "DA4 9EW",
+        252103073016,
+        254956651016,
+        "Return accepted Copy",
+        "Package/thick envelope",
+        "cm",
+        45,
+        45,
+        16,
+        Math.ceil(weight),
+        "",
+        row[11] || "",
+        row[12] || "",
+        row[13] || "",
+        row[14] || "",
+        row[15] || "",
+        row[16] || "",
+        row[5] || "",
+        "",
+        rrp,
+        brand,
+        row[6] || "",
+        "S3G TEP",
+        "",
+        "",
+        skuLocation,
+        condition,
+        fullTitle,
+        brand,
+      ];
+
+      processedRows.push(newRow);
+
+      if (idx % 50 === 0) {
+        self.postMessage({
+          type: "progress",
+          message: `Building Excel: ${idx + 1}/${dataRows.length} rows...`,
+        });
+        await sleep(0);
+      }
+    }
+
+    const totalsRow = new Array(106).fill("");
+    totalsRow[22] = round(
+      dataRows.reduce((sum, row) => sum + (parseFloat(row[20]) || 0), 0)
+    );
+    totalsRow[24] = round(totalRRP);
+    totalsRow[25] = round(totalRRP);
+    totalsRow[26] = round(totalCost);
+    totalsRow[27] = round(totalShippingAlloc);
+    totalsRow[28] = round(totalVAT);
+    totalsRow[29] = round(totalTotalCost);
+
+    processedRows.push(totalsRow);
+
+    // Create Excel with formulas
+    self.postMessage({ type: "progress", message: "Adding Excel formulas..." });
+    await sleep(0);
+
+    const newWorkbook = XLSX.utils.book_new();
+    const newWorksheet = XLSX.utils.aoa_to_sheet(processedRows);
+
+    for (let i = 0; i < dataRows.length; i++) {
+      const excelRow = i + 2;
+      const row = dataRows[i];
+      const quantity = parseInt(row[17]) || 1;
+
+      const colRRP = getExcelColumn(24);
+      const colQuantity = getExcelColumn(19);
+      const colCost = getExcelColumn(26);
+      const colShipping = getExcelColumn(27);
+      const colVAT = getExcelColumn(28);
+      const colTotalCost = getExcelColumn(29);
+      const colCostPerOne = getExcelColumn(30);
+      const colPostage = getExcelColumn(31);
+      const colPrice = getExcelColumn(45);
+      const colBestOffer = getExcelColumn(69);
+
+      newWorksheet[`${colShipping}${excelRow}`] = {
+        t: "n",
+        v: round(itemShipping[i] || 0),
+      };
+
+      const vatFormula = `=ROUND((${colCost}${excelRow}+${colShipping}${excelRow})*0.2,2)`;
+      newWorksheet[`${colVAT}${excelRow}`] = {
+        t: "n",
+        f: vatFormula,
+        v: round(
+          (parseFloat(processedRows[i + 1][26]) +
+            parseFloat(processedRows[i + 1][27])) *
+            0.2
+        ),
+      };
+
+      const totalCostFormula = `=ROUND(${colCost}${excelRow}+${colShipping}${excelRow}+${colVAT}${excelRow},2)`;
+      newWorksheet[`${colTotalCost}${excelRow}`] = {
+        t: "n",
+        f: totalCostFormula,
+        v: round(
+          parseFloat(processedRows[i + 1][26]) +
+            parseFloat(processedRows[i + 1][27]) +
+            parseFloat(processedRows[i + 1][28])
+        ),
+      };
+
+      const costPerOneFormula = `=ROUND(${colTotalCost}${excelRow}/${colQuantity}${excelRow},2)`;
+      newWorksheet[`${colCostPerOne}${excelRow}`] = {
+        t: "n",
+        f: costPerOneFormula,
+        v: round(parseFloat(processedRows[i + 1][29]) / quantity),
+      };
+
+      const priceFormula = `=ROUND((${colRRP}${excelRow}*0.85)+0.15+${colPostage}${excelRow},2)`;
+      newWorksheet[`${colPrice}${excelRow}`] = {
+        t: "n",
+        f: priceFormula,
+        v: round(
+          parseFloat(row[22]) * 0.85 +
+            0.15 +
+            parseFloat(processedRows[i + 1][31])
+        ),
+      };
+
+      const bestOfferFormula = `=ROUND(${colPrice}${excelRow}*0.93,2)`;
+      newWorksheet[`${colBestOffer}${excelRow}`] = {
+        t: "n",
+        f: bestOfferFormula,
+        v: round(parseFloat(processedRows[i + 1][45]) * 0.93),
+      };
+
+      const colPrice2 = getExcelColumn(66);
+      newWorksheet[`${colPrice2}${excelRow}`] = {
+        t: "n",
+        f: priceFormula,
+        v: round(
+          parseFloat(row[22]) * 0.85 +
+            0.15 +
+            parseFloat(processedRows[i + 1][31])
+        ),
+      };
+
+      if (i % 100 === 0) await sleep(0);
+    }
+
+    const totalsRowNumber = dataRows.length + 2;
+    newWorksheet[`${getExcelColumn(22)}${totalsRowNumber}`] = {
+      t: "n",
+      f: `SUBTOTAL(9,W2:W${dataRows.length + 1})`,
+      v: totalsRow[22],
+    };
+    newWorksheet[`${getExcelColumn(24)}${totalsRowNumber}`] = {
+      t: "n",
+      f: `SUBTOTAL(9,Y2:Y${dataRows.length + 1})`,
+      v: totalsRow[24],
+    };
+    newWorksheet[`${getExcelColumn(25)}${totalsRowNumber}`] = {
+      t: "n",
+      f: `SUBTOTAL(9,Z2:Z${dataRows.length + 1})`,
+      v: totalsRow[25],
+    };
+    newWorksheet[`${getExcelColumn(26)}${totalsRowNumber}`] = {
+      t: "n",
+      f: `SUBTOTAL(9,AA2:AA${dataRows.length + 1})`,
+      v: totalsRow[26],
+    };
+    newWorksheet[`${getExcelColumn(27)}${totalsRowNumber}`] = {
+      t: "n",
+      f: `SUBTOTAL(9,AB2:AB${dataRows.length + 1})`,
+      v: totalsRow[27],
+    };
+    newWorksheet[`${getExcelColumn(28)}${totalsRowNumber}`] = {
+      t: "n",
+      f: `SUBTOTAL(9,AC2:AC${dataRows.length + 1})`,
+      v: totalsRow[28],
+    };
+    newWorksheet[`${getExcelColumn(29)}${totalsRowNumber}`] = {
+      t: "n",
+      f: `SUBTOTAL(9,AD2:AD${dataRows.length + 1})`,
+      v: totalsRow[29],
+    };
+
+    XLSX.utils.book_append_sheet(newWorkbook, newWorksheet, dateSKU);
+
+    // Add Postage Rate Table
+    const finalPostageRates = postageRates || postageRateTable;
+    const postageTableData = [
+      [
+        "Weight (Max)",
+        "Postage (£)",
+        "Royal Mail Basic",
+        "Fuel",
+        "Vat",
+        "Diff",
+        "Code",
+      ],
+    ];
+
+    finalPostageRates.forEach((rate) => {
+      const rmBasic = round(rate.postage / 0.74);
+      const fuel = round(rmBasic * 1.08);
+      const vat = round(fuel * 1.2);
+      const diff = round(vat - rate.postage);
+
+      postageTableData.push([
+        rate.maxWeight,
+        rate.postage,
+        rmBasic,
+        fuel,
+        vat,
+        diff,
+        rate.code,
+      ]);
+    });
+
+    const postageSheet = XLSX.utils.aoa_to_sheet(postageTableData);
+    XLSX.utils.book_append_sheet(
+      newWorkbook,
+      postageSheet,
+      "Postage Rate Table"
+    );
+
+    // Generate Excel blob
+    self.postMessage({ type: "progress", message: "Generating Excel file..." });
+    await sleep(0);
+
+    const wbout = XLSX.write(newWorkbook, { bookType: "xlsx", type: "array" });
+    const excelBlob = new Blob([wbout], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const excelUrl = URL.createObjectURL(excelBlob);
+    const excelFilename = `LISTING_${dateSKU}.xlsx`;
+
+    // Create eBay CSV (comma-separated format)
+    self.postMessage({ type: "progress", message: "Generating eBay CSV..." });
+    await sleep(0);
+
+    const ebayRows = [];
+    ebayRows.push(
+      "#INFO,Version=0.0.2,Template= eBay-draft-listings-template_GB,,,,,,,,"
+    );
+    ebayRows.push(
+      "#INFO Action and Category ID are required fields. 1) Set Action to Draft 2) Please find the category ID for your listings here: https://pages.ebay.com/sellerinformation/news/categorychanges.html,,,,,,,,,,"
+    );
+    ebayRows.push(
+      "#INFO After you've successfully uploaded your draft from the Seller Hub Reports tab, complete your drafts to active listings here: https://www.ebay.co.uk/sh/lst/drafts,,,,,,,,,"
+    );
+    ebayRows.push("#INFO,,,,,,,,,,");
+    ebayRows.push(
+      "Action(SiteID=UK|Country=GB|Currency=GBP|Version=1193|CC=UTF-8),Custom label (SKU),Category ID,Title,UPC,Price,Quantity,Item photo URL,Condition ID,Description,Format"
+    );
+
+    processedRows.slice(1, -1).forEach((row) => {
+      const action = "Draft";
+      const customLabel = row[33] || ""; // SKU at index 33
+      const categoryId = row[42] || 47155;
+      const title = row[43] || "";
+      const upc = String(row[7] || "").toLowerCase(); // ASIN in lowercase (original column at index 7)
+      const price = round(row[45]) || 0;
+      const quantity = row[46] || 1;
+      const photoUrl = row[47] || "";
+      const conditionId = 1500;
+      const description = String(row[49] || "");
+      const format = "FixedPrice";
+
+      const escapeCsv = (val) => {
+        const str = String(val);
+        if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+
+      // Comma-separated values
+      ebayRows.push(
+        [
+          action,
+          customLabel,
+          categoryId,
+          escapeCsv(title),
+          upc,
+          price,
+          quantity,
+          photoUrl,
+          conditionId,
+          escapeCsv(description),
+          format,
+        ].join(",")
+      );
+    });
+
+    const csvContent = ebayRows.join("\n");
+    const csvBlob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const csvUrl = URL.createObjectURL(csvBlob);
+    const csvFilename = `ebay_upload_${dateSKU}.csv`;
+
+    const categoryInfo =
+      categoryMap.length > 0
+        ? ` Categories matched from ${categoryMap.length} options.`
+        : " Using default category 47155.";
+    const postageInfo = postageRates
+      ? ` Postage rates from uploaded table (${postageRates.length} tiers).`
+      : " Using default postage rates.";
+
+    self.postMessage({
+      type: "success",
+      message: `✅ Success! Downloaded LISTING_${dateSKU}.xlsx and ebay_upload_${dateSKU}.csv with ${dataRows.length} items!${categoryInfo}${postageInfo}`,
+      url: excelUrl,
+      filename: excelFilename,
+      csvUrl: csvUrl,
+      csvFilename: csvFilename,
+    });
+  } catch (error) {
+    self.postMessage({
+      type: "error",
+      error: error.message,
+    });
+    console.error("Worker error:", error);
+  }
+};
