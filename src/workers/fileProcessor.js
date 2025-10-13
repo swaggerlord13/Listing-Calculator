@@ -330,10 +330,11 @@ self.onmessage = async (e) => {
   } = e.data;
 
   try {
-    // Apply shipping discount to PDF data if provided
-    if (shippingDiscount && shippingDiscount > 0) {
+    // Apply shipping discount equally divided among all PDFs
+    if (shippingDiscount && shippingDiscount > 0 && pdfDataArray.length > 0) {
+      const discountPerPDF = shippingDiscount / pdfDataArray.length;
       pdfDataArray.forEach((pdf) => {
-        pdf.shipping = Math.max(0, pdf.shipping - shippingDiscount);
+        pdf.shipping = Math.max(0, pdf.shipping - discountPerPDF);
       });
     }
 
