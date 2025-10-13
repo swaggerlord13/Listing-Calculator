@@ -1,8 +1,6 @@
 // eslint-disable-next-line no-redeclare
 /* global self, importScripts, XLSX */
 
-const DEBUG = false;
-
 // Load XLSX library
 importScripts("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js");
 
@@ -97,12 +95,6 @@ class CategoryIndex {
       buildTime: elapsed,
       isNewUpload: true,
     });
-
-    if (DEBUG) {
-      console.log(
-        `✓ Category index built: ${this.categories.length} categories, ${this.tokenIndex.size} tokens in ${elapsed}ms`
-      );
-    }
   }
 
   match(title) {
@@ -178,12 +170,7 @@ class CategoryIndex {
     });
 
     if (!bestMatch || bestScore < 5) {
-      if (DEBUG) console.log(`⚠ No good match for "${title}"`);
       return { categoryId: 47155, categoryPath: "Default", score: 0 };
-    }
-
-    if (DEBUG) {
-      console.log(`✓ "${title}" → ${bestMatch.path} (${bestScore})`);
     }
 
     return {
@@ -305,7 +292,6 @@ const parsePostageRates = (postageData) => {
     }
   }
   rates.sort((a, b) => a.maxWeight - b.maxWeight);
-  if (DEBUG) console.log("Parsed Postage Rates:", rates);
   return rates;
 };
 
@@ -334,10 +320,23 @@ self.onmessage = async (e) => {
     return;
   }
 
-  const { excelBuffer, pdfDataArray, categoryBuffer, postageBuffer, date } =
-    e.data;
+  const {
+    excelBuffer,
+    pdfDataArray,
+    categoryBuffer,
+    postageBuffer,
+    date,
+    shippingDiscount,
+  } = e.data;
 
   try {
+    // Apply shipping discount to PDF data if provided
+    if (shippingDiscount && shippingDiscount > 0) {
+      pdfDataArray.forEach((pdf) => {
+        pdf.shipping = Math.max(0, pdf.shipping - shippingDiscount);
+      });
+    }
+
     // Load Excel
     self.postMessage({ type: "progress", message: "Loading Excel file..." });
     await sleep(0);
@@ -367,12 +366,8 @@ self.onmessage = async (e) => {
       const catWorksheet = catWorkbook.Sheets[catSheetName];
       categoryMap = XLSX.utils.sheet_to_json(catWorksheet);
 
-      // BUILD THE INDEX HERE - CRITICAL!
       categoryIndex.build(categoryMap);
-
-      if (DEBUG) console.log(`✓ Indexed ${categoryMap.length} categories`);
     } else if (!categoryIndex.isInitialized) {
-      // No upload and no cache - check main Excel
       const catSheetName = workbook.SheetNames.find(
         (name) =>
           name.toLowerCase().includes("category") ||
@@ -382,24 +377,15 @@ self.onmessage = async (e) => {
         const catWorksheet = workbook.Sheets[catSheetName];
         categoryMap = XLSX.utils.sheet_to_json(catWorksheet);
 
-        // BUILD THE INDEX HERE TOO
         categoryIndex.build(categoryMap);
-
-        if (DEBUG)
-          console.log(`✓ Indexed ${categoryMap.length} categories from Excel`);
       }
     } else {
-      // Using cached categories
       self.postMessage({
         type: "category_cache",
         count: categoryIndex.categories.length,
         isCached: true,
         isNewUpload: false,
       });
-      if (DEBUG)
-        console.log(
-          `✓ Using cached categories (${categoryIndex.categories.length})`
-        );
     }
 
     // Load Postage Rates
@@ -420,7 +406,6 @@ self.onmessage = async (e) => {
       });
 
       postageRates = parsePostageRates(postageData);
-      if (DEBUG) console.log(`✓ Loaded ${postageRates.length} postage rates`);
     } else {
       const postageSheetName = workbook.SheetNames.find((name) =>
         name.toLowerCase().includes("postage")
@@ -431,14 +416,10 @@ self.onmessage = async (e) => {
           header: 1,
         });
         postageRates = parsePostageRates(postageData);
-        if (DEBUG)
-          console.log(
-            `✓ Loaded ${postageRates.length} postage rates from Excel`
-          );
       }
     }
 
-    // Extract SKUs
+    // Extract SKUs from Column C (index 2) - will be Column E after shift
     self.postMessage({
       type: "progress",
       message: "Extracting SKUs from Column C...",
@@ -454,15 +435,10 @@ self.onmessage = async (e) => {
 
       if (sku) {
         manifestSKUs.push({ sku, rowIndex: idx });
-        if (DEBUG) console.log(`✓ Row ${idx + 1}: Column C = "${sku}"`);
-      } else {
-        if (DEBUG) console.warn(`⚠ Row ${idx + 1}: Column C empty`);
       }
 
       if (idx % 50 === 0) await sleep(0);
     }
-
-    if (DEBUG) console.log(`\n✓ Total SKUs: ${manifestSKUs.length}`);
 
     // Search PDFs for SKUs
     self.postMessage({
@@ -497,12 +473,6 @@ self.onmessage = async (e) => {
               invoiceDate: pdfData.invoiceDate,
               vendorNumber: pdfData.vendorNumber,
             });
-            if (DEBUG)
-              console.log(
-                `✓ ${sku} → £${firstPrice.toFixed(2)} (PDF ${
-                  pdfData.index + 1
-                })`
-              );
             found = true;
             break;
           }
@@ -510,7 +480,6 @@ self.onmessage = async (e) => {
       }
 
       if (!found) {
-        if (DEBUG) console.warn(`⚠ SKU not found: ${sku}`);
         items.push({
           sku: sku,
           cost: 0,
@@ -573,7 +542,7 @@ self.onmessage = async (e) => {
       await sleep(0);
     }
 
-    // Allocate shipping
+    // Allocate shipping using Currency (Weight × Quantity)
     self.postMessage({
       type: "progress",
       message: "Allocating shipping costs...",
@@ -592,23 +561,26 @@ self.onmessage = async (e) => {
         itemsByPDF[pdfIndex] = {
           items: [],
           shipping: pdfShipping,
-          totalWeight: 0,
+          totalCurrency: 0,
         };
       }
 
       const weight = parseFloat(row[20]) || 0;
-      itemsByPDF[pdfIndex].items.push({ rowIndex: idx, weight });
-      itemsByPDF[pdfIndex].totalWeight += weight;
+      const quantity = parseInt(row[17]) || 1;
+      const currency = weight * quantity; // Currency = Weight × Quantity
+
+      itemsByPDF[pdfIndex].items.push({ rowIndex: idx, currency });
+      itemsByPDF[pdfIndex].totalCurrency += currency;
     });
 
     const itemShipping = {};
     for (const pdfIndex of Object.keys(itemsByPDF)) {
       const pdfGroup = itemsByPDF[pdfIndex];
 
-      pdfGroup.items.forEach(({ rowIndex, weight }) => {
+      pdfGroup.items.forEach(({ rowIndex, currency }) => {
         const shipping =
-          pdfGroup.totalWeight > 0
-            ? (weight / pdfGroup.totalWeight) * pdfGroup.shipping
+          pdfGroup.totalCurrency > 0
+            ? (currency / pdfGroup.totalCurrency) * pdfGroup.shipping
             : 0;
         itemShipping[rowIndex] = shipping;
       });
@@ -760,7 +732,6 @@ self.onmessage = async (e) => {
       const rrpText = `RRP £${roundedRRP}`;
       const fullTitle = `${shortenedTitle} ${rrpText}`;
 
-      // USE OPTIMIZED CATEGORY MATCHING - MUCH FASTER!
       const categoryId = matchCategory(originalTitle);
 
       const skuLocation = `/${sku}/${postageInfo.code}`;
@@ -782,10 +753,22 @@ self.onmessage = async (e) => {
       totalVAT += vat;
       totalTotalCost += totalCostCalc;
 
+      // Build row with Currency replaced (Column V = index 21)
+      const rowData = [];
+      for (let i = 0; i < 24; i++) {
+        if (i === 21) {
+          // Column V (index 21) = Currency - replace GBP with Weight × Quantity
+          const currencyValue = weight * quantity;
+          rowData.push(currencyValue);
+        } else {
+          rowData.push(row[i]);
+        }
+      }
+
       const newRow = [
         invoiceDate,
         vendorNumber,
-        ...row.slice(0, 24),
+        ...rowData,
         cost,
         shipping,
         vat,
@@ -880,6 +863,13 @@ self.onmessage = async (e) => {
     }
 
     const totalsRow = new Array(106).fill("");
+    totalsRow[23] = round(
+      dataRows.reduce((sum, row) => {
+        const weight = parseFloat(row[20]) || 0;
+        const quantity = parseInt(row[17]) || 1;
+        return sum + weight * quantity;
+      }, 0)
+    ); // Total Currency at index 23 (Order Date + Vendor + Column V which is index 21)
     totalsRow[22] = round(
       dataRows.reduce((sum, row) => sum + (parseFloat(row[20]) || 0), 0)
     );
@@ -903,9 +893,12 @@ self.onmessage = async (e) => {
       const excelRow = i + 2;
       const row = dataRows[i];
       const quantity = parseInt(row[17]) || 1;
+      const weight = parseFloat(row[20]) || 0;
 
       const colRRP = getExcelColumn(24);
       const colQuantity = getExcelColumn(19);
+      const colWeight = getExcelColumn(22);
+      const colCurrency = getExcelColumn(23); // Column V in output (index 21 + 2 for Order Date + Vendor)
       const colCost = getExcelColumn(26);
       const colShipping = getExcelColumn(27);
       const colVAT = getExcelColumn(28);
@@ -914,6 +907,14 @@ self.onmessage = async (e) => {
       const colPostage = getExcelColumn(31);
       const colPrice = getExcelColumn(45);
       const colBestOffer = getExcelColumn(69);
+
+      // Set Currency formula: Weight × Quantity (Column V)
+      const currencyFormula = `=${colWeight}${excelRow}*${colQuantity}${excelRow}`;
+      newWorksheet[`${colCurrency}${excelRow}`] = {
+        t: "n",
+        f: currencyFormula,
+        v: round(weight * quantity),
+      };
 
       newWorksheet[`${colShipping}${excelRow}`] = {
         t: "n",
@@ -982,6 +983,14 @@ self.onmessage = async (e) => {
     }
 
     const totalsRowNumber = dataRows.length + 2;
+
+    // Currency column total (Column X in output)
+    newWorksheet[`${getExcelColumn(23)}${totalsRowNumber}`] = {
+      t: "n",
+      f: `SUBTOTAL(9,X2:X${dataRows.length + 1})`,
+      v: totalsRow[23],
+    };
+
     newWorksheet[`${getExcelColumn(22)}${totalsRowNumber}`] = {
       t: "n",
       f: `SUBTOTAL(9,W2:W${dataRows.length + 1})`,
@@ -1151,6 +1160,5 @@ self.onmessage = async (e) => {
       type: "error",
       error: error.message,
     });
-    console.error("Worker error:", error);
   }
 };
