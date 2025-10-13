@@ -8,6 +8,7 @@ const ListingCalculator = () => {
   const [categoryMapFile, setCategoryMapFile] = useState(null);
   const [postageRateFile, setPostageRateFile] = useState(null);
   const [date, setDate] = useState('');
+  const [shippingDiscount, setShippingDiscount] = useState('');
   const [processing, setProcessing] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -109,6 +110,7 @@ const ListingCalculator = () => {
     setCategoryMapFile(null);
     setPostageRateFile(null);
     setDate('');
+    setShippingDiscount('');
     setError('');
     setSuccess('');
     setProgress('');
@@ -239,7 +241,8 @@ const ListingCalculator = () => {
         pdfDataArray,
         categoryBuffer,
         postageBuffer,
-        date
+        date,
+        shippingDiscount: shippingDiscount ? parseFloat(shippingDiscount) : 0
       });
 
     } catch (err) {
@@ -332,6 +335,11 @@ const ListingCalculator = () => {
                 <h4 className="info-title">📄 Extracted from PDF:</h4>
                 <div className="info-content">
                   <p><strong>Total Shipping:</strong> £{extractedData.totalShipping.toFixed(2)}</p>
+                  {shippingDiscount && parseFloat(shippingDiscount) > 0 && (
+                    <p><strong>After Discount:</strong> £{Math.max(0, extractedData.totalShipping - (parseFloat(shippingDiscount) * pdfDataArray.length)).toFixed(2)} 
+                      <span style={{ fontSize: '0.75rem', opacity: 0.8 }}> (£{parseFloat(shippingDiscount).toFixed(2)} × {pdfDataArray.length} PDF{pdfDataArray.length > 1 ? 's' : ''})</span>
+                    </p>
+                  )}
                   <p><strong>SKUs Found:</strong> {extractedData.items.filter(i => i.cost > 0).length} of {extractedData.items.length}</p>
                   {pdfDataArray && pdfDataArray.length > 0 && (
                     <>
@@ -364,6 +372,30 @@ const ListingCalculator = () => {
                 {date && (
                   <p className="sku-preview">
                     SKU prefix: <span className="sku-code">{formatDateToSKU(date)}</span>
+                  </p>
+                )}
+              </div>
+
+              <div className="form-card">
+                <div className="form-header">
+                  <div className="form-icon form-icon-purple">
+                    <FileSpreadsheet size={20} />
+                  </div>
+                  <h3>Shipping Discount £ <span style={{ fontSize: '0.75rem', fontWeight: 'normal', opacity: 0.7 }}>(Optional)</span></h3>
+                </div>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={shippingDiscount}
+                  onChange={(e) => setShippingDiscount(e.target.value)}
+                  placeholder="e.g., 4.15"
+                  className="date-input"
+                  style={{ fontFamily: 'monospace' }}
+                />
+                {shippingDiscount && (
+                  <p className="sku-preview">
+                    Discount: <span className="sku-code">£{parseFloat(shippingDiscount).toFixed(2)}</span>
                   </p>
                 )}
               </div>
@@ -507,7 +539,7 @@ const ListingCalculator = () => {
                   <p>Background processing - UI stays smooth!</p>
                 </div>
                 
-                {(excelFile || pdfFiles.length > 0 || categoryMapFile || postageRateFile || date) && (
+                {(excelFile || pdfFiles.length > 0 || categoryMapFile || postageRateFile || date || shippingDiscount) && (
                   <button onClick={clearAllInputs} className="clear-button">
                     <RefreshCw size={16} />
                     Clear All
