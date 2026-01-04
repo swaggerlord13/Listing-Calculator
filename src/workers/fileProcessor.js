@@ -243,6 +243,45 @@ const generateTags = (title) => {
   return words.slice(0, 15).join(", ");
 };
 
+// Extract item specifics from title and description
+const extractItemSpecifics = (title, description) => {
+  const specifics = {};
+  const text = `${title} ${description}`.toLowerCase();
+
+  // Size patterns (UK sizes, EU sizes, US sizes, general sizes)
+  const sizeMatch = text.match(/\b(size[:\s]*)?(\d+(\.\d+)?)\s*(uk|eu|us|cm|mm|ml|l|kg|g|oz|inches?|in)?\b/i) ||
+                   text.match(/\b(small|medium|large|x-?large|xx-?large|xs|s|m|l|xl|xxl|xxxl)\b/i);
+  if (sizeMatch) {
+    specifics.Size = sizeMatch[0].trim();
+  }
+
+  // Color patterns
+  const colorMatch = text.match(/\b(colour?[:\s]*)?(black|white|red|blue|green|yellow|pink|purple|orange|grey|gray|brown|beige|navy|gold|silver|multi-?colou?r)\b/i);
+  if (colorMatch) {
+    specifics.Color = colorMatch[2] || colorMatch[0];
+  }
+
+  // Material patterns
+  const materialMatch = text.match(/\b(material[:\s]*)?(cotton|polyester|leather|wool|silk|denim|suede|nylon|plastic|metal|wood|glass|ceramic|rubber)\b/i);
+  if (materialMatch) {
+    specifics.Material = materialMatch[2] || materialMatch[0];
+  }
+
+  // Gender patterns
+  const genderMatch = text.match(/\b(men'?s?|women'?s?|unisex|boys?|girls?|kids?|children'?s?)\b/i);
+  if (genderMatch) {
+    specifics.Gender = genderMatch[0];
+  }
+
+  // Age group patterns
+  const ageMatch = text.match(/\b(adult|child|baby|toddler|infant|teen)\b/i);
+  if (ageMatch) {
+    specifics.AgeGroup = ageMatch[0];
+  }
+
+  return specifics;
+};
+
 const shortenTitle = (title, maxLength = 70) => {
   if (!title) return "";
   const fillers = [
@@ -598,7 +637,6 @@ self.onmessage = async (e) => {
 
     const dateSKU = formatDateToSKU(date);
     const asinToSKU = {};
-    let skuCounter = 1;
 
     let totalRRP = 0;
     let totalCost = 0;
@@ -606,8 +644,34 @@ self.onmessage = async (e) => {
     let totalVAT = 0;
     let totalTotalCost = 0;
 
+    // First pass: collect all unique item specifics across all rows
+    self.postMessage({
+      type: "progress",
+      message: "Analyzing item specifics...",
+    });
+    await sleep(0);
+
+    const allSpecificsKeys = new Set();
+    const rowSpecifics = []; // Store specifics for each row
+
+    for (let idx = 0; idx < dataRows.length; idx++) {
+      const row = dataRows[idx];
+      const originalTitle = row[3] || "";
+      const description = String(row[4] || "");
+      const specifics = extractItemSpecifics(originalTitle, description);
+
+      rowSpecifics.push(specifics);
+      Object.keys(specifics).forEach(key => allSpecificsKeys.add(key));
+
+      if (idx % 50 === 0) await sleep(0);
+    }
+
+    // Convert to sorted array for consistent column order
+    const specificsColumns = Array.from(allSpecificsKeys).sort();
+
     const processedRows = [];
 
+    // Build header row WITHOUT C: columns (those go in eBay CSV only)
     const headerRow = [
       "Order Date",
       "Vendor",
@@ -702,8 +766,9 @@ self.onmessage = async (e) => {
       const weight = parseFloat(row[20]) || 0;
       const quantity = parseInt(row[17]) || 1;
       const rrp = parseFloat(row[22]) || 0;
-      const brand = row[8] || "";
+      const brand = row[8] || ""; // Brand from uploaded excel (column index 8)
       const condition = row[18] || "";
+      // Note: subcategory (row[10]) is extracted later in eBay CSV generation
 
       const manifestSKU = manifestSKUs[idx]?.sku || "";
       const pdfItem = items.find((item) => item.sku === manifestSKU);
@@ -714,17 +779,19 @@ self.onmessage = async (e) => {
       const cost = round(proportionalCosts[idx] || 0);
       const shipping = round(itemShipping[idx] || 0);
 
-      if (asin && !asinToSKU[asin]) {
-        asinToSKU[asin] = dateSKU + String(skuCounter).padStart(2, "0");
-        skuCounter++;
-      }
-      const sku = asinToSKU[asin] || dateSKU + "01";
-
       const vat = round((cost + shipping) * 0.2);
       const totalCostCalc = round(cost + shipping + vat);
       const costPerOne = round(
         quantity > 0 ? totalCostCalc / quantity : totalCostCalc
       );
+
+      // Update SKU to include rounded up cost per one in format: dateSKU/costPerOne/
+      const roundedUpCostPerOne = Math.ceil(costPerOne);
+
+      if (asin && !asinToSKU[asin]) {
+        asinToSKU[asin] = `${dateSKU}/${roundedUpCostPerOne}/`;
+      }
+      const sku = asinToSKU[asin] || `${dateSKU}/${roundedUpCostPerOne}/`;
       const postageInfo = getPostageInfo(weight, postageRates);
 
       const originalTitle = row[3] || "";
@@ -766,6 +833,7 @@ self.onmessage = async (e) => {
         }
       }
 
+      // Build the complete row (NO dynamic C: columns in main Excel)
       const newRow = [
         invoiceDate,
         vendorNumber,
@@ -818,7 +886,7 @@ self.onmessage = async (e) => {
         "N/A",
         brand,
         "",
-        "",
+        condition,
         "GB",
         "Dartford",
         "DA4 9EW",
@@ -863,7 +931,8 @@ self.onmessage = async (e) => {
       }
     }
 
-    const totalsRow = new Array(106).fill("");
+    // Create totals row with dynamic size based on header length
+    const totalsRow = new Array(headerRow.length).fill("");
     totalsRow[23] = round(
       dataRows.reduce((sum, row) => {
         const weight = parseFloat(row[20]) || 0;
@@ -1079,7 +1148,7 @@ self.onmessage = async (e) => {
     const excelUrl = URL.createObjectURL(excelBlob);
     const excelFilename = `LISTING_${dateSKU}.xlsx`;
 
-    // Create eBay CSV
+    // Create eBay CSV with C: columns
     self.postMessage({ type: "progress", message: "Generating eBay CSV..." });
     await sleep(0);
 
@@ -1094,11 +1163,47 @@ self.onmessage = async (e) => {
       "#INFO After you've successfully uploaded your draft from the Seller Hub Reports tab, complete your drafts to active listings here: https://www.ebay.co.uk/sh/lst/drafts,,,,,,,,,"
     );
     ebayRows.push("#INFO,,,,,,,,,,");
-    ebayRows.push(
-      "Action(SiteID=UK|Country=GB|Currency=GBP|Version=1193|CC=UTF-8),Custom label (SKU),Category ID,Title,UPC,Price,Quantity,Item photo URL,Condition ID,Description,Format"
-    );
 
-    processedRows.slice(1, -1).forEach((row) => {
+    // Build eBay CSV header with C: prefix for ALL specifics (like script3.js)
+    const ebayBaseHeader = [
+      "Action(SiteID=UK|Country=GB|Currency=GBP|Version=1193|CC=UTF-8)",
+      "Custom label (SKU)",
+      "Category ID",
+      "Title",
+      "UPC",
+      "Price",
+      "Quantity",
+      "Item photo URL",
+      "Condition ID",
+      "Description",
+      "Format",
+    ];
+
+    // Collect ALL unique specifics keys (Brand, Type, and extracted ones)
+    const allEbaySpecificsKeys = new Set();
+    allEbaySpecificsKeys.add("Brand");
+    allEbaySpecificsKeys.add("Type");
+    specificsColumns.forEach(key => allEbaySpecificsKeys.add(key));
+
+    // Sort for consistent column order
+    const sortedEbaySpecificsKeys = Array.from(allEbaySpecificsKeys).sort();
+
+    // Add C: prefix to ALL specifics columns
+    const ebayHeaderSpecifics = sortedEbaySpecificsKeys.map(key => `C:${key}`);
+    const ebayHeaderRow = [...ebayBaseHeader, ...ebayHeaderSpecifics];
+    ebayRows.push(ebayHeaderRow.join(","));
+
+    // Helper function to escape CSV values
+    const escapeCsv = (val) => {
+      if (val === null || val === undefined) return "";
+      const str = String(val);
+      if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    processedRows.slice(1, -1).forEach((row, idx) => {
       const action = "Draft";
       const customLabel = row[33] || "";
       const categoryId = row[42] || 47155;
@@ -1111,29 +1216,43 @@ self.onmessage = async (e) => {
       const description = String(row[49] || "");
       const format = "FixedPrice";
 
-      const escapeCsv = (val) => {
-        const str = String(val);
-        if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-          return `"${str.replace(/"/g, '""')}"`;
-        }
-        return str;
+      // Get brand and subcategory from original data
+      const dataRow = dataRows[idx];
+      const brand = dataRow[8] || "";
+      const subcategory = dataRow[10] || "";
+
+      // Get item specifics for this row
+      const itemSpecifics = rowSpecifics[idx] || {};
+
+      // Build complete specifics object including Brand and Type
+      const allSpecificsForRow = {
+        Brand: brand,
+        Type: subcategory,
+        ...itemSpecifics
       };
 
-      ebayRows.push(
-        [
-          action,
-          customLabel,
-          categoryId,
-          escapeCsv(title),
-          upc,
-          price,
-          quantity,
-          photoUrl,
-          conditionId,
-          escapeCsv(description),
-          format,
-        ].join(",")
-      );
+      // Map all specifics values in the sorted order
+      const dataSpecifics = sortedEbaySpecificsKeys.map((key) => {
+        const value = allSpecificsForRow[key] || "";
+        return escapeCsv(value);
+      });
+
+      const ebayRowData = [
+        action,
+        customLabel,
+        categoryId,
+        escapeCsv(title),
+        upc,
+        price,
+        quantity,
+        photoUrl,
+        conditionId,
+        escapeCsv(description),
+        format,
+        ...dataSpecifics
+      ];
+
+      ebayRows.push(ebayRowData.join(","));
     });
 
     const csvContent = ebayRows.join("\n");
